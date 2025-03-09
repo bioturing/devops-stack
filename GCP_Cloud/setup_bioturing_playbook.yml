@@ -1,0 +1,289 @@
+---
+- name: "Bioturing EcosystemX: Full Setup and Deployment"
+  hosts: all
+  become: true
+  vars:
+    gpu_enabled: "no"  # Set to "yes" to enable GPU support
+    ecosystemx_version: "3.0.7"
+    ecosystemx_repo: "bioturing/ecosystemx12:3.0.7"
+    http_port: 80
+    https_port: 443
+    mount_path: "/ecosystemx"
+    env_file_path: "/etc/docker/ecosystemx.env"
+
+  tasks:
+   
+    # -------------------------------------
+    # Verify and Mount Additional Disk
+    # -------------------------------------
+    - name: Identify unmounted additional disk (ignore root disk)
+      shell: |
+        lsblk -ndo NAME,MOUNTPOINT | awk '$2=="" && $1!="sda" {print $1}'
+      register: disk_output
+      changed_when: false
+
+    - name: Debug - Show detected additional disk
+      debug:
+        msg: "Detected additional disk: /dev/{{ disk_output.stdout | default('NOT FOUND') }}"
+
+    - name: Fail if no additional disk is found
+      fail:
+        msg: "No available unmounted additional disk found!"
+      when: disk_output.stdout | length == 0
+
+    - name: Format the disk as XFS
+      filesystem:
+        fstype: xfs
+        dev: "/dev/{{ disk_output.stdout }}"
+      when: disk_output.stdout is defined and disk_output.stdout | length > 0
+
+    - name: Create mount point directory
+      file:
+        path: /ecosystemx
+        state: directory
+        mode: '0755'
+
+    - name: Mount the disk
+      mount:
+        path: /ecosystemx
+        src: "/dev/{{ disk_output.stdout }}"
+        fstype: xfs
+        opts: defaults
+        state: mounted
+
+    - name: Persist mount in fstab
+      lineinfile:
+        path: /etc/fstab
+        line: "/dev/{{ disk_output.stdout }} /ecosystemx xfs defaults 0 0"
+        state: present
+
+    - name: Persist mount in fstab
+      lineinfile:
+        path: /etc/fstab
+        line: "/dev/{{ disk_output.stdout_lines[0] }} {{ mount_path }} xfs defaults 0 0"
+        state: present
+
+
+    # -------------------------------------
+    # Load Docker Credentials (Vault-Protected)
+    # -------------------------------------
+    - name: Load Docker Credentials
+      include_vars:
+        file: docker_credentials.yml
+      no_log: true  
+
+    # -------------------------------------
+    # Validate System Requirements
+    # -------------------------------------
+    - name: Check root partition capacity
+      shell: df -B1 --output=size / | tail -n 1
+      register: root_size
+      changed_when: false
+
+    - name: Fail if root partition is less than 64GB
+      fail:
+        msg: "The root partition should be at least 64GB!"
+      when: root_size.stdout | int < 64424509440
+
+    # -------------------------------------
+    # Install System Dependencies (Without Python3-Pip)
+    # -------------------------------------
+    - name: Update package list
+      apt:
+        update_cache: yes
+
+    - name: Install required system dependencies (No Python3)
+      apt:
+        name:
+          - net-tools
+          - curl
+          - wget
+          - ca-certificates
+          - git
+          - software-properties-common
+        state: present
+
+    # -------------------------------------
+    # Install Docker (Only If Not Installed)
+    # -------------------------------------
+    - name: Check if Docker is already installed
+      command: docker --version
+      register: docker_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Install Docker (if not installed)
+      shell: curl -fsSL https://get.docker.com | sh
+      when: docker_check.rc != 0
+
+    - name: Enable and start Docker service
+      systemd:
+        name: docker
+        enabled: yes
+        state: started
+
+    # -------------------------------------
+    # Ensure Environment File Exists
+    # -------------------------------------
+    - name: Ensure `/etc/docker/` directory exists
+      file:
+        path: /etc/docker
+        state: directory
+        mode: '0755'
+
+    - name: Copy `ecosystemx.env` file from playbook directory
+      copy:
+        src: "{{ playbook_dir }}/ecosystemx.env"
+        dest: "{{ env_file_path }}"
+        mode: '0644'
+
+    - name: Debug - Verify `ecosystemx.env` file exists
+      stat:
+        path: "{{ env_file_path }}"
+      register: env_file_status
+
+    - name: Fail if `ecosystemx.env` is missing
+      fail:
+         msg: "Environment file {{ env_file_path }} not found! Deployment cannot continue."
+      when: not env_file_status.stat.exists
+
+
+    # -------------------------------------
+    # Docker Login (Ensure Authentication)
+    # -------------------------------------
+    - name: Authenticate with Docker Hub
+      shell: echo "{{ docker_password }}" | docker login --username "{{ docker_username }}" --password-stdin
+      register: docker_login_status
+      failed_when: docker_login_status.rc != 0
+      no_log: true
+
+    - name: Verify Docker Login
+      command: docker info
+      register: docker_info
+      failed_when: "'Username' not in docker_info.stdout"
+      changed_when: false
+
+    - name: Debug - Docker login successful
+      debug:
+        msg: "Docker authentication successful!"
+
+    # -------------------------------------
+    # Install NVIDIA Drivers & Toolkit (Only If Not Installed)
+    # -------------------------------------
+    - name: Check if NVIDIA drivers are already installed
+      command: nvidia-smi
+      register: nvidia_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Debug - Show NVIDIA driver status
+      debug:
+        msg: "{{ nvidia_check.stdout }}"
+      when: gpu_enabled | lower == "yes"
+
+    - name: Install NVIDIA drivers (if not already installed)
+      apt:
+        name:
+          - ubuntu-drivers-common
+          - nvidia-driver-550
+        state: present
+      when: gpu_enabled | lower == "yes" and nvidia_check.rc != 0
+
+    - name: Enable NVIDIA GPU Default Mode
+      command: "nvidia-smi -c 0"
+      ignore_errors: yes
+      when: gpu_enabled | lower == "yes" and nvidia_check.rc == 0
+
+    - name: Enable NVIDIA Persistence Mode
+      command: "nvidia-smi -pm 1"
+      ignore_errors: yes
+      when: gpu_enabled | lower == "yes" and nvidia_check.rc == 0
+
+    # -------------------------------------
+    # Clean & Install NVIDIA Container Toolkit
+    # -------------------------------------
+    - name: Remove existing NVIDIA repository file (if exists)
+      file:
+        path: /etc/apt/sources.list.d/nvidia-container-toolkit.list
+        state: absent
+      when: gpu_enabled | lower == "yes"
+
+    - name: Remove old NVIDIA keyrings (if exists)
+      file:
+        path: /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+        state: absent
+      when: gpu_enabled | lower == "yes"
+
+    - name: Add NVIDIA repository
+      shell: |
+        distribution=$(. /etc/os-release;echo $ID$VERSION_ID) && \
+        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+          gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg && \
+        curl -s -L https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.list | \
+          sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+          tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+      when: gpu_enabled | lower == "yes"
+
+    - name: Update package list after adding NVIDIA repository
+      apt:
+        update_cache: yes
+      when: gpu_enabled | lower == "yes"
+
+    - name: Install NVIDIA Container Toolkit
+      apt:
+        name: nvidia-container-toolkit
+        state: present
+      when: gpu_enabled | lower == "yes"
+
+    - name: Restart Docker service
+      systemd:
+        name: docker
+        state: restarted
+      when: gpu_enabled | lower == "yes"
+
+    # -------------------------------------
+    # Deploy Bioturing EcosystemX
+    # -------------------------------------
+    - name: Stop and remove previous EcosystemX container
+      command: docker rm -f ecosystemx
+      ignore_errors: yes
+
+    - name: Pull Bioturing EcosystemX Docker image
+      command: docker pull "{{ ecosystemx_repo }}"
+      register: docker_pull_status
+      retries: 3
+      delay: 10
+      until: docker_pull_status.rc == 0
+
+    - name: Debug - Show Docker image pull status
+      debug:
+        msg: "{{ docker_pull_status.stdout_lines }}"
+
+    - name: Deploy Bioturing EcosystemX container
+      command: >
+        docker run -d --name ecosystemx --restart always
+        --env-file {{ env_file_path }}
+        -p {{ http_port }}:80 -p {{ https_port }}:443
+        -v {{ mount_path }}/database:/database:rw
+        -v {{ mount_path }}/database/certificates:/usr/local/share/ca-certificates:rw
+        -v {{ mount_path }}/userdata:/home/shared:rw
+        -v {{ mount_path }}/examples:/s3/colab/content:rw
+        --shm-size="32gb"
+        {% if gpu_enabled | lower == "yes" %}
+        --gpus all
+        --cap-add SYS_ADMIN --device /dev/fuse --security-opt apparmor:unconfined
+        {% endif %}
+        {{ ecosystemx_repo }}
+
+    # -------------------------------------
+    # Verification Steps
+    # -------------------------------------
+    - name: List running Docker containers
+      command: docker ps -a
+      register: docker_ps_output
+      changed_when: false
+
+    - name: Debug - Show running Docker containers
+      debug:
+        msg: "{{ docker_ps_output.stdout_lines }}"
+
